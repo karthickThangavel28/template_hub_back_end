@@ -42,10 +42,17 @@ async function safeCleanup(workDir) {
 }
 
 exports.deployTemplate = async (req, res) => {
-  const { templateId, repoName, configData } = req.body;
+  const { templateId, repoName } = req.body;
   const user = req.user;
 
-  if (!templateId || !repoName || !configData) {
+  let configData;
+  try {
+    configData = JSON.parse(req.body.configData);
+  } catch {
+    return res.status(400).json({ message: "Invalid configData JSON" });
+  }
+
+  if (!templateId || !repoName) {
     return res.status(400).json({ message: "Missing required fields" });
   }
 
@@ -60,7 +67,7 @@ exports.deployTemplate = async (req, res) => {
     userId: user._id,
     templateId,
     repoName,
-    status: "FORKING",
+    status: "INIT",
     logs: [],
   });
 
@@ -71,26 +78,45 @@ exports.deployTemplate = async (req, res) => {
   );
 
   try {
-    /* ---------------- SOURCE REPO ---------------- */
+    /* =====================================================
+       1️⃣ FORK + CLONE
+    ===================================================== */
 
     const repoUrl = new URL(template.sourceRepoUrl);
     const sourceOwner = repoUrl.pathname.split("/")[1];
     const sourceRepo = repoUrl.pathname.split("/")[2].replace(".git", "");
 
-    deployment.logs.push(`Forking ${sourceOwner}/${sourceRepo}`);
-    await deployment.save();
+    // idempotent fork
+    try {
+      await octokit.rest.repos.get({
+        owner: user.username,
+        repo: sourceRepo,
+      });
+    } catch {
+      await octokit.rest.repos.createFork({
+        owner: sourceOwner,
+        repo: sourceRepo,
+      });
+      await delay(5000);
+    }
 
-    /* ---------------- FORK ---------------- */
+    // wait for fork
+    let ready = false;
+    for (let i = 0; i < 10; i++) {
+      try {
+        await octokit.rest.repos.get({
+          owner: user.username,
+          repo: sourceRepo,
+        });
+        ready = true;
+        break;
+      } catch {
+        await delay(3000);
+      }
+    }
+    if (!ready) throw new Error("Fork not ready");
 
-    await octokit.rest.repos.createFork({
-      owner: sourceOwner,
-      repo: sourceRepo,
-    });
-
-    await delay(5000);
-
-    /* ---------------- RENAME FORK ---------------- */
-
+    // rename fork
     await octokit.rest.repos.update({
       owner: user.username,
       repo: sourceRepo,
@@ -99,10 +125,8 @@ exports.deployTemplate = async (req, res) => {
 
     await delay(3000);
 
-    /* ---------------- CLONE ---------------- */
-
+    // clone
     fs.removeSync(workDir);
-
     execSync(
       `git clone https://github.com/${user.username}/${repoName}.git "${workDir}"`,
       { stdio: "inherit" }
@@ -113,138 +137,94 @@ exports.deployTemplate = async (req, res) => {
       `git remote set-url origin https://${safeToken}@github.com/${user.username}/${repoName}.git`,
       { cwd: workDir }
     );
-    execSync("git config --local --unset credential.helper", { cwd: workDir });
 
-    /* ---------------- CONFIG FILE ---------------- */
+    try {
+      execSync("git config --local --unset credential.helper", {
+        cwd: workDir,
+      });
+    } catch {}
 
+    /* =====================================================
+       2️⃣ PREPARE ASSETS (IMAGES + CONFIG)
+    ===================================================== */
+
+    const publicAssetsRoot = path.join(workDir, "public", "assets");
+    const userDir = path.join(publicAssetsRoot, "user");
+    const projectDir = path.join(publicAssetsRoot, "projects");
+
+    fs.ensureDirSync(userDir);
+    fs.ensureDirSync(projectDir);
+
+    // USER IMAGE
+    if (req.files?.userImage?.[0]) {
+      const file = req.files.userImage[0];
+      const ext = path.extname(file.originalname);
+      const fileName = `profile${ext}`;
+
+      fs.copySync(file.path, path.join(userDir, fileName));
+      fs.removeSync(file.path);
+
+      configData.personal ??= {};
+      configData.personal.profileImage = `/assets/user/${fileName}`;
+    }
+
+    // PROJECT IMAGES
+    if (req.files?.projectImages?.length) {
+      configData.projects ??= [{}];
+      configData.projects[0].images ??= [];
+
+      req.files.projectImages.forEach((file, idx) => {
+        const ext = path.extname(file.originalname);
+        const fileName = `project-${idx + 1}${ext}`;
+
+        fs.copySync(file.path, path.join(projectDir, fileName));
+        fs.removeSync(file.path);
+
+        configData.projects[0].images.push(
+          `/assets/projects/${fileName}`
+        );
+      });
+    }
+
+    // write config (source)
     fs.writeJSONSync(path.join(workDir, "data.json"), configData, {
       spaces: 2,
     });
 
-    /* ---------------- TECH DETECTION ---------------- */
+    /* =====================================================
+       3️⃣ BUILD PROJECT (VITE)
+    ===================================================== */
 
-    const pkgPath = path.join(workDir, "package.json");
-    const hasPkg = fs.existsSync(pkgPath);
-    const pkg = hasPkg ? fs.readJSONSync(pkgPath) : {};
+    execSync("npm install", { cwd: workDir, stdio: "inherit" });
+    execSync("npm run build", { cwd: workDir, stdio: "inherit" });
 
-    let buildCmd = null;
-    let distDir = null;
-    let framework = "unknown";
-
-    /* ================= NEXT.JS ================= */
-    if (fs.existsSync(path.join(workDir, "next.config.js"))) {
-      deployment.logs.push("Detected Next.js");
-      framework = "nextjs";
-
-      const nextConfigPath = path.join(workDir, "next.config.js");
-      let nextConfig = fs.readFileSync(nextConfigPath, "utf8");
-
-      // 🔥 Always enforce static export + basePath
-      if (!nextConfig.includes("output:")) {
-        nextConfig = nextConfig.replace(
-          /module\.exports\s*=\s*\{/,
-          `module.exports = {
-  output: "export",
-  basePath: "/${repoName}",
-  assetPrefix: "/${repoName}/",`
-        );
-      } else {
-        nextConfig = nextConfig
-          .replace(/basePath\s*:\s*['"].*?['"],?/g, "")
-          .replace(/assetPrefix\s*:\s*['"].*?['"],?/g, "");
-      }
-
-      fs.writeFileSync(nextConfigPath, nextConfig);
-
-      buildCmd = "npm run build";
-      distDir = "out";
-    } else if (
-      /* ================= VITE (React / Vue / Svelte) ================= */
-      fs.existsSync(path.join(workDir, "vite.config.js")) ||
-      fs.existsSync(path.join(workDir, "vite.config.ts"))
-    ) {
-      deployment.logs.push("Detected Vite");
-      framework = "vite";
-
-      const vitePath = fs.existsSync(path.join(workDir, "vite.config.js"))
-        ? path.join(workDir, "vite.config.js")
-        : path.join(workDir, "vite.config.ts");
-
-      let viteConfig = fs.readFileSync(vitePath, "utf8");
-
-      // 🔥 ALWAYS replace base (even if it exists)
-      if (/base\s*:/.test(viteConfig)) {
-        viteConfig = viteConfig.replace(
-          /base\s*:\s*['"].*?['"]/,
-          `base: "/${repoName}/"`
-        );
-      } else {
-        viteConfig = viteConfig.replace(
-          /defineConfig\s*\(\s*\{/,
-          `defineConfig({\n  base: "/${repoName}/",`
-        );
-      }
-
-      fs.writeFileSync(vitePath, viteConfig);
-
-      buildCmd = "npm run build";
-      distDir = "dist";
-    } else if (fs.existsSync(path.join(workDir, "angular.json"))) {
-      /* ================= ANGULAR ================= */
-      deployment.logs.push("Detected Angular");
-      framework = "angular";
-
-      buildCmd = `npm run build -- --base-href=/${repoName}/`;
-      distDir = `dist/${pkg.name}`;
-    } else if (pkg.dependencies?.["react-scripts"]) {
-      /* ================= REACT (CRA) ================= */
-      deployment.logs.push("Detected React (CRA)");
-      framework = "react-cra";
-
-      pkg.homepage = `https://${user.username}.github.io/${repoName}`;
-      fs.writeJSONSync(pkgPath, pkg, { spaces: 2 });
-
-      buildCmd = "npm run build";
-      distDir = "build";
-    } else if (fs.existsSync(path.join(workDir, "index.html"))) {
-      /* ================= STATIC HTML ================= */
-      deployment.logs.push("Detected Static HTML");
-      framework = "static-html";
-
-      buildCmd = null;
-      distDir = ".";
-    } else {
-      /* ================= UNSUPPORTED ================= */
-      throw new Error("Unsupported project type");
+    const distDir = path.join(workDir, "dist");
+    if (!fs.existsSync(distDir)) {
+      throw new Error("Vite build failed: dist not found");
     }
 
-    /* ---------------- INSTALL ---------------- */
-
-    if (hasPkg) {
-      deployment.logs.push("Installing dependencies...");
-      await deployment.save();
-
-      execSync("npm install", { cwd: workDir, stdio: "inherit" });
+    // copy assets into dist
+    if (fs.existsSync(publicAssetsRoot)) {
+      fs.copySync(publicAssetsRoot, path.join(distDir, "assets"));
     }
 
-    /* ---------------- BUILD ---------------- */
+    // copy data.json into dist
+    fs.writeJSONSync(
+      path.join(distDir, "data.json"),
+      configData,
+      { spaces: 2 }
+    );
 
-    if (buildCmd) {
-      deployment.logs.push("Building project...");
-      await deployment.save();
+    /* =====================================================
+       4️⃣ DEPLOY TO gh-pages
+    ===================================================== */
 
-      execSync(buildCmd, { cwd: workDir, stdio: "inherit" });
-    }
+    const backupDir = path.join(
+      path.dirname(workDir),
+      `__dist__${Date.now()}`
+    );
 
-    /* ---------------- DEPLOY gh-pages ---------------- */
-
-    const finalDist = path.join(workDir, distDir);
-    if (!fs.existsSync(finalDist)) {
-      throw new Error("Build output not found");
-    }
-
-    const backupDir = path.join(path.dirname(workDir), `__dist__${Date.now()}`);
-    fs.copySync(finalDist, backupDir);
+    fs.copySync(distDir, backupDir);
 
     execSync("git checkout --orphan gh-pages", { cwd: workDir });
     execSync("git reset --hard", { cwd: workDir });
@@ -254,40 +234,49 @@ exports.deployTemplate = async (req, res) => {
     fs.removeSync(backupDir);
 
     execSync("git add .", { cwd: workDir });
-    execSync(`git commit -m "Deploy via Template Hub"`, { cwd: workDir });
-    execSync("git push -f origin gh-pages", { cwd: workDir });
 
-    /* ---------------- ENABLE PAGES ---------------- */
+    const status = execSync("git status --porcelain", {
+      cwd: workDir,
+    }).toString();
 
+    if (status) {
+      execSync('git commit -m "Deploy via Template Hub"', {
+        cwd: workDir,
+        stdio: "inherit",
+      });
+    }
+
+    execSync("git push -f origin gh-pages", {
+      cwd: workDir,
+      stdio: "inherit",
+    });
+
+    // enable pages
     try {
       await octokit.rest.repos.createPagesSite({
         owner: user.username,
         repo: repoName,
         source: { branch: "gh-pages", path: "/" },
       });
-    } catch (err) {
-      if (err.status !== 409) throw err;
+    } catch (e) {
+      if (e.status !== 409) throw e;
     }
-
-    /* ---------------- FINAL ---------------- */
 
     const deployedUrl = `https://${user.username}.github.io/${repoName}/`;
 
     deployment.status = "SUCCESS";
     deployment.deployedUrl = deployedUrl;
-    deployment.logs.push("Deployment successful");
     await deployment.save();
 
     return res.json({
       success: true,
       deployedUrl,
-      repoUrl: `https://github.com/${user.username}/${repoName}`,
     });
   } catch (err) {
+    console.error(err);
     deployment.status = "FAILED";
     deployment.logs.push(err.message);
     await deployment.save();
-
     return res.status(500).json({ message: err.message });
   } finally {
     await safeCleanup(workDir);
