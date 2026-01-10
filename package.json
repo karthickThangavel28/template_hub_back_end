@@ -18,6 +18,8 @@
     "express": "^5.2.1",
     "express-session": "^1.18.2",
     "fs-extra": "^11.3.3",
+    "get-port": "^7.1.0",
+    "groq-sdk": "^0.37.0",
     "jsonwebtoken": "^9.0.3",
     "mongoose": "^9.1.2",
     "multer": "^2.0.2",

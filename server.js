@@ -10,6 +10,8 @@ require('./config/passport');
 const authRoutes = require('./routes/authRoutes');
 const templateRoutes = require('./routes/templateRoutes');
 const deploymentRoutes = require('./routes/deploymentRoutes');
+const chatRoute = require("./routes/chat");
+
 
 const app = express();
 
@@ -59,6 +61,8 @@ mongoose.connect(process.env.MONGO_URI)
 app.use('/auth', authRoutes);
 app.use('/api/templates', templateRoutes);
 app.use('/api/deploy', deploymentRoutes);
+app.use("/api/chat", chatRoute);
+
 
 app.get('/', (req, res) => {
   res.send('Template Hub API is running');
