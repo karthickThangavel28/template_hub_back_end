@@ -1,5 +1,5 @@
 const router = require("express").Router();
-const deploymentController = require("../controllers/deploymentController");
+const deploymentController = require("../controllers/deployment.controller");
 const upload = require("../middlewares/upload");
 
 
